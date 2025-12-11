@@ -1,24 +1,15 @@
-# echo_sync/ui_main.py
+# al principio de ui_main.py (agrega)
+import json
 import os
-from PySide6.QtWidgets import (
-    QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget,
-    QListWidgetItem, QLineEdit, QSlider, QFileDialog, QTextEdit, QMessageBox
-)
-from PySide6.QtGui import QPixmap, QIcon
-from PySide6.QtCore import Qt, Slot
-
-from .spotify_api import SpotifyAPI
-from .player import HybridPlayer
-from .local_manager import LocalManager
-from .lyrics_manager import LyricsManager
-from .workers import SearchWorker, RecommendationsWorker, YTDLWorker
-
-ASSETS = os.path.join(os.path.dirname(__file__), '..', 'assets')
+from pathlib import Path
+import numpy as np
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
 class EchoSyncApp(QWidget):
     def __init__(self):
         super().__init__()
-        # Spotify keys: pon las tuyas aquí,estas son las mias,necsitas cambiarlas
+        # Spotify keys: pon las tuyas aquí o carga desde env
         client_id = "cf4379a10a984c4e9f7eda9ebdce9add"
         client_secret = "92db1f6d12a4477082ae44c96855bdd3"
 
@@ -29,9 +20,36 @@ class EchoSyncApp(QWidget):
         self.current_track_list = []
         self.current_playing = None
 
+        # Paths para persistencia
+        root = Path(__file__).resolve().parents[1]
+        self.data_dir = root / "data"
+        self.favorites_path = self.data_dir / "favorites.json"
+        self.library_path = self.data_dir / "library.json"
+        self.playlists_path = self.data_dir / "playlists.json"
+
+        self.favorites = self._load_json(self.favorites_path, default=[])
+        self.library = self._load_json(self.library_path, default=[])
+        self.playlists = self._load_json(self.playlists_path, default={})
+
         self._build_ui()
         self._connect_signals()
+        # conectar señales del player para visualizador
+        self.player.position_changed.connect(self._on_position_update_for_visualizer)
 
+    def _load_json(self, path: Path, default):
+        try:
+            if path.exists():
+                return json.loads(path.read_text(encoding='utf-8'))
+        except Exception as e:
+            print("Error cargando", path, e)
+        return default
+
+    def _save_json_background(self, path: Path, payload):
+        # guarda en background para no bloquear UI
+        worker = PersistenceWorker(str(path), payload)
+        worker.start()
+
+    # --- BUILD UI: añade una pestaña de recomendaciones ---
     def _build_ui(self):
         self.setWindowTitle("EchoSync")
         root_layout = QVBoxLayout(self)
@@ -53,21 +71,34 @@ class EchoSyncApp(QWidget):
 
         root_layout.addLayout(top)
 
-        # Middle: results + lyrics
-        mid = QHBoxLayout()
+        # Middle: Tabs (Resultados | Recomendaciones | Local | Biblioteca)
+        tabs_layout = QHBoxLayout()
         self.results_list = QListWidget()
-        mid.addWidget(self.results_list, 65)
+        tabs_layout.addWidget(self.results_list, 60)
 
         right_col = QVBoxLayout()
         self.lyrics_view = QTextEdit()
         self.lyrics_view.setReadOnly(True)
         right_col.addWidget(QLabel("Letras"))
         right_col.addWidget(self.lyrics_view)
-        mid.addLayout(right_col, 35)
+        tabs_layout.addLayout(right_col, 40)
 
-        root_layout.addLayout(mid, 85)
+        root_layout.addLayout(tabs_layout, 85)
 
-        # Bottom: player controls
+        # Buttons encima de results: Recomendaciones, Cargar local, Favoritos
+        controls_top = QHBoxLayout()
+        self.reco_btn = QPushButton("🎧 Recomendaciones")
+        self.reco_btn.clicked.connect(self.on_recommendations)
+        controls_top.addWidget(self.reco_btn)
+        load_local_btn = QPushButton("📁 Agregar carpeta local")
+        load_local_btn.clicked.connect(self.on_add_folder)
+        controls_top.addWidget(load_local_btn)
+        fav_btn = QPushButton("❤️ Favoritos")
+        fav_btn.clicked.connect(self.on_show_favorites)
+        controls_top.addWidget(fav_btn)
+        root_layout.addLayout(controls_top)
+
+        # Bottom: player controls + visualizer
         bottom = QHBoxLayout()
         self.prev_btn = QPushButton("⏮")
         self.play_btn = QPushButton("▶")
@@ -80,11 +111,24 @@ class EchoSyncApp(QWidget):
         bottom.addWidget(self.next_btn)
         bottom.addWidget(QLabel("Vol"))
         bottom.addWidget(self.volume)
+
+        # Visualizador FFT (matplotlib canvas)
+        fig = Figure(figsize=(4,1.2), tight_layout=True)
+        self.ax = fig.add_subplot(111)
+        self.ax.set_ylim(0, 1)
+        self.ax.set_xlim(0, 5000)  # frecuencia hasta 5kHz por defecto
+        self.ax.get_xaxis().set_visible(False)
+        self.ax.get_yaxis().set_visible(False)
+        self.canvas = FigureCanvas(fig)
+        bottom.addWidget(self.canvas, 1)
+
+        root_layout.addLayout(bottom)
+        # Barra de progreso grande abajo del todo
         self.progress = QSlider(Qt.Horizontal)
         self.progress.setRange(0, 100)
         root_layout.addWidget(self.progress)
-        root_layout.addLayout(bottom)
 
+    # --- Conexiones ---
     def _connect_signals(self):
         self.search_input.returnPressed.connect(self.on_search)
         self.results_list.itemDoubleClicked.connect(self.on_play_selected)
@@ -92,98 +136,126 @@ class EchoSyncApp(QWidget):
         self.prev_btn.clicked.connect(self.on_prev)
         self.next_btn.clicked.connect(self.on_next)
         self.volume.valueChanged.connect(self.on_volume_change)
-        # Player signals
         self.player.position_changed.connect(self.on_position_update)
         self.player.state_changed.connect(self.on_state_change)
 
-    @Slot()
-    def on_search(self):
-        q = self.search_input.text().strip()
-        if not q:
+    # --- Recomendaciones (no bloqueante) ---
+    def on_recommendations(self):
+        # construir seeds: usa favoritos + library reciente
+        seed_ids = []
+        # favoritos guardan spotify ids
+        seed_ids.extend(self.favorites if isinstance(self.favorites, list) else [])
+        # últimos items de library
+        recent = [s.get('spotify_id') for s in sorted(self.library, key=lambda x: x.get('added_date',''), reverse=True)]
+        for r in recent:
+            if r and r not in seed_ids:
+                seed_ids.append(r)
+            if len(seed_ids) >= 5:
+                break
+        if not seed_ids:
+            QMessageBox.information(self, "Info", "No hay semillas para recomendaciones (agrega favoritos o biblioteca).")
             return
-        self.results_list.clear()
-        self.results_list.addItem("Buscando...")
-        self.search_worker = SearchWorker(self.spotify, q)
-        self.search_worker.finished_search.connect(self.display_search_results)
-        self.search_worker.start()
+        self.reco_btn.setEnabled(False)
+        self.reco_btn.setText("Generando...")
+        self.reco_worker = RecommendationsWorker(self.spotify, seed_ids)
+        self.reco_worker.finished.connect(self._on_recommendations_ready)
+        self.reco_worker.start()
 
-    @Slot(list)
-    def display_search_results(self, results):
+    def _on_recommendations_ready(self, results):
+        self.reco_btn.setEnabled(True)
+        self.reco_btn.setText("🎧 Recomendaciones")
+        # mostrar resultados en la lista principal
         self.results_list.clear()
         self.current_track_list = results
         if not results:
-            self.results_list.addItem("No results")
+            self.results_list.addItem("No se pudieron generar recomendaciones.")
             return
         for t in results:
+            item = QListWidgetItem(f"[Reco] {t['name']} — {t['artist']} ({t['duration']})")
+            item.setData(Qt.UserRole, t)
+            self.results_list.addItem(item)
+
+    # --- Agregar carpeta local (sin bloquear) ---
+    def on_add_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta de música")
+        if not folder:
+            return
+        # Escaneo en hilo simple (podés mover a worker si es muy lento)
+        added = self.local.scan_folder(folder)
+        QMessageBox.information(self, "Música local", f"Agregadas {len(added)} pistas.")
+        # actualizar library automáticamente?
+        # opcional: añadir los locales a self.library si quieres
+
+    # --- Favoritos UI ---
+    def on_show_favorites(self):
+        self.results_list.clear()
+        if not self.favorites:
+            self.results_list.addItem("No tienes favoritos.")
+            return
+        # buscar metadatos en self.library para mostrar nombres
+        for fid in self.favorites:
+            # buscar en library
+            found = next((s for s in self.library if s.get('spotify_id')==fid), None)
+            if found:
+                t = {'id': found.get('spotify_id'), 'name': found.get('title'), 'artist': found.get('artist'), 'duration': found.get('duration')}
+            else:
+                t = {'id': fid, 'name': fid, 'artist':'', 'duration':'0:00'}
             item = QListWidgetItem(f"{t['name']} — {t['artist']} ({t['duration']})")
             item.setData(Qt.UserRole, t)
             self.results_list.addItem(item)
 
-    @Slot()
-    def on_play_selected(self, item: QListWidgetItem):
-        track = item.data(Qt.UserRole)
-        self.play_track(track)
-
-    def play_track(self, track):
-        # If track is from spotify search we try to resolve via yt-dlp in background
-        self.current_playing = track
-        q = f"{track['name']} {track['artist']} audio"
-        # spawn YTDL worker
-        self.yt_worker = YTDLWorker(q)
-        self.yt_worker.resolved.connect(lambda url: self._play_resolved_url(url, track))
-        self.yt_worker.failed.connect(lambda e: QMessageBox.warning(self, "YT Error", f"No se resolvió: {e}"))
-        self.yt_worker.start()
-
+    # --- Reproducción & persistencia favorites/library ---
     def _play_resolved_url(self, url, track):
         ok = self.player.play_url(url)
         if ok:
             self.play_btn.setText("⏸")
-            # load lyrics async-lite
             l = self.lyrics.get_lyrics(track['name'], track['artist'])
             self.lyrics_view.setPlainText(l)
+            self.current_playing = track
 
-    @Slot()
-    def on_toggle_play(self):
-        if self.player.is_playing:
-            self.player.pause()
-            self.play_btn.setText("▶")
+    def add_to_favorites(self, track):
+        tid = track.get('id')
+        if not tid:
+            return
+        if tid in self.favorites:
+            self.favorites.remove(tid)
         else:
-            # If nothing loaded, try play selected
-            if not self.current_playing and self.results_list.currentItem():
-                self.on_play_selected(self.results_list.currentItem())
-            else:
-                self.player.pause()  # it toggles
-                self.play_btn.setText("⏸" if self.player.is_playing else "▶")
+            self.favorites.append(tid)
+        # guardar async
+        self._save_json_background(self.favorites_path, self.favorites)
 
-    @Slot(int, int)
-    def on_position_update(self, cur, tot):
-        if tot > 0:
-            self.progress.setMaximum(tot)
-            self.progress.setValue(cur)
+    def add_to_library(self, track):
+        # track es dict de spotify (search result)
+        entry = {
+            'title': track['name'],
+            'artist': track['artist'],
+            'duration': track['duration'],
+            'duration_seconds': track['duration_ms']//1000,
+            'spotify_id': track['id'],
+            'added_date': __import__('datetime').datetime.utcnow().isoformat()
+        }
+        # prevent duplicates
+        if not any(s.get('spotify_id')==entry['spotify_id'] for s in self.library):
+            self.library.append(entry)
+            self._save_json_background(self.library_path, self.library)
+            QMessageBox.information(self, "Añadida", f"'{entry['title']}' agregada a tu biblioteca.")
 
-    @Slot(bool)
-    def on_state_change(self, playing):
-        self.play_btn.setText("⏸" if playing else "▶")
+    # --- Visualizador: recibimos posiciones periódicos del player ---
+    def _on_position_update_for_visualizer(self, cur, tot):
+        # Simple approach: leer una porción de audio estéreo local o stream no es trivial.
+        # Aquí hacemos un placeholder visual: generamos una onda sinusoidal que cambia con el tiempo.
+        # hacer FFT real, hay que capturar el buffer de audio (p. ej. con ffmpeg/portaudio).
+        x = np.linspace(0,1,256)
+        # frecuencia variable según posición
+        freq = 200 + (cur % 30) * 50
+        amp = 0.5 + 0.5 * np.abs(np.sin(cur/5))
+        y = amp * np.abs(np.sin(2*np.pi*freq*x))
+        self.ax.clear()
+        self.ax.plot(x*5000, y)  # x*5000 para simular freq
+        self.ax.set_ylim(0,1.2)
+        self.ax.get_xaxis().set_visible(False)
+        self.ax.get_yaxis().set_visible(False)
+        self.canvas.draw_idle()
 
-    @Slot(int)
-    def on_volume_change(self, v):
-        self.player.set_volume(v)
-
-    @Slot()
-    def on_prev(self):
-        # basic previous behaviour
-        try:
-            idx = next(i for i,t in enumerate(self.current_track_list) if t['id']==self.current_playing['id'])
-            prev = self.current_track_list[idx-1] if idx>0 else self.current_track_list[-1]
-            self.play_track(prev)
-        except Exception:
-            pass
-
-    @Slot()
-    def on_next(self):
-        try:
-            idx = next(i for i,t in enumerate(self.current_track_list) if t['id']==self.current_playing['id'])
-            nxt = self.current_track_list[(idx+1)%len(self.current_track_list)]
-            self.play_track(nxt)
-        except Exception:
-            pass
+    # --- Resto de handlers (on_search, display_search_results, on_play_selected, on_toggle_play, etc.)
+    # Usá las implementaciones previas que ya te di y llama add_to_library/add_to_favorites donde corresponda.
